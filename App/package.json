@@ -1,0 +1,21 @@
+{
+  "name": "webrtc-screen-share-tauri",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri dev": "tauri dev",
+    "tauri build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^1.5.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.5.0",
+    "vite": "^5.0.0"
+  }
+}

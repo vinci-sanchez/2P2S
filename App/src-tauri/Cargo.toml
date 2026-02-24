@@ -1,0 +1,18 @@
+[package]
+name = "webrtc-screen-share"
+version = "0.0.1"
+description = "WebRTC screen sharing"
+authors = ["vinci_sanchez"]
+edition = "2021"
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = ["shell-open"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

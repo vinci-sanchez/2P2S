@@ -1,0 +1,7 @@
+日志
+App/node_modules
+App/logs
+App/dist
+App/src-tauri/target
+Gin/logs
+Gin/.env

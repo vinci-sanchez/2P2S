@@ -1,0 +1,50 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:5173",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "2P2S(tauri)",
+    "version": "0.0.1"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "all": false,
+        "open": "^((mailto:\\w+)|(tel:\\w+)|(https?://\\w+)|(file://.+)|([A-Za-z]:\\\\.+)|(/.+))"
+      }
+    },
+    "windows": [
+      {
+        "title": "2P2S(tauri)",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true
+      }
+    ],
+    "bundle": {
+      "active": true,
+      "identifier": "com.example.webrtc-screenshare",
+      "icon": [
+        "icons/icon.ico"
+      ],
+      "targets": "all",
+      "windows": {
+        "webviewInstallMode": {
+          "type": "downloadBootstrapper"
+        }
+      }
+    },
+    "security": {
+      "csp": null,
+      "dangerousRemoteDomainIpcAccess": []
+    }
+  }
+}
