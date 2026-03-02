@@ -1,18 +1,17 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WebRTC 屏幕共享</title>
+    <title>2P2S</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <div class="container">
       <header>
-        <div>
-          <p>Tauri + WebRTC</p>
-          <h1>屏幕共享</h1>
-          <p class="subtitle">局域网 IP / 虚拟内网环境</p>
+        <div class="title-block">
+          <h1>2P2S</h1>
+          <p class="subtitle">单向视频 · 纯 libzt 双通道（信令 + 视频帧）</p>
         </div>
         <div class="status">
           <span id="status_point" class="status-dot"></span>
@@ -25,50 +24,69 @@
           <h2>连接配置</h2>
           <div class="form-grid">
             <label>
-              <span>信令服务器 IP</span>
-              <input id="host_ip" type="text" placeholder="例如 10.0.0.5" />
+              <span>本机虚拟 IP（ZeroTier）</span>
+              <input id="host_ip" type="text" placeholder="加入网络后自动填入" readonly />
             </label>
             <label>
-              <span>端口</span>
+              <span>基础端口（信令）</span>
               <input id="port" type="number" min="1" max="65535" />
             </label>
             <label>
-              <span>Network</span>
-              <input id="network_input" type="text" placeholder="network" />
+              <span>Network（libzt 网络 ID）</span>
+              <input id="network_input" type="text" placeholder="例如 8056c2e21c000001" />
             </label>
             <label>
               <span>角色</span>
               <select id="role_select">
-                <option value="share">分享者（发起屏幕）</option>
-                <option value="viewer">观看者（接收屏幕）</option>
+                <option value="share">分享端</option>
+                <option value="viewer">观看端</option>
               </select>
             </label>
             <label>
-              <span>对方 IP（观看者）</span>
-              <input id="peer_ip" type="text" placeholder="例如 10.0.0.6" />
+              <span>对方 IP（观看端）</span>
+              <input id="peer_ip" type="text" placeholder="例如 10.147.20.8" />
+            </label>
+            <label>
+              <span>码率档位（共享端）</span>
+              <select id="quality_select">
+                <option value="360p">360p</option>
+                <option value="480p">480p</option>
+                <option value="720p" selected>720p</option>
+                <option value="1080p">1080p</option>
+              </select>
+            </label>
+            <label>
+              <span>帧率（共享端）</span>
+              <select id="fps_select">
+                <option value="15">15 fps</option>
+                <option value="30" selected>30 fps</option>
+                <option value="60">60 fps</option>
+              </select>
             </label>
           </div>
 
           <div class="actions">
-            <button id="connect_btn">连接信令</button>
+            <button id="connect_btn">建立 libzt 通道</button>
             <button id="start_btn">开始共享/观看</button>
             <button id="quickViewBtn">输入 IP 观看</button>
+            <button id="mute_remote_btn">无音频（保留）</button>
             <button id="open_log_btn">打开日志文件夹</button>
             <button id="stop_btn">断开</button>
           </div>
-
-          <p>提示：分享者连接后，观看者通过输入 IP 快速加入即可自动发起协商。</p>
         </section>
 
         <section>
-          <div class="media">
-            <div>
-              <h3>本地预览</h3>
-              <video id="local_video" autoplay muted playsinline></video>
-            </div>
-            <div>
-              <h3>远端画面</h3>
-              <video id="remote_video" autoplay playsinline></video>
+          <div class="media merged-media">
+            <div class="merged-video-card">
+              <div class="merged-video-header">
+                <h3>画面</h3>
+                <span id="video_source_tag" class="video-source-tag">无信号</span>
+              </div>
+              <div class="merged-video-stage">
+                <video id="local_video" autoplay muted playsinline></video>
+                <canvas id="remote_canvas" class="video-hidden"></canvas>
+              </div>
+              <div id="remote_stats" class="video-stats">Bitrate: - kbps | FPS: -</div>
             </div>
           </div>
           <div>

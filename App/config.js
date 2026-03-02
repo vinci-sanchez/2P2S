@@ -4,6 +4,7 @@
     secure: true,
     defaultHost: "www-www.u2934071.nyat.app",
     defaultPort: 34157,
+    network:"83048a06329208f8"
   },
   user: {
     defaultNetwork: "",
@@ -11,9 +12,9 @@
   },
   media: {
     video: {
-      frameRate: 15,
-      width: { max: 1920 },
-      height: { max: 1080 },
+      frameRate: 30,
+      width: { ideal: 1280, max: 1280 },
+      height: { ideal: 720, max: 720 },
     },
     audio: false,
   },

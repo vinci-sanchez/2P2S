@@ -35,6 +35,9 @@
       "icon": [
         "icons/icon.ico"
       ],
+      "resources": [
+        "public/libzt.dll"
+      ],
       "targets": "all",
       "windows": {
         "webviewInstallMode": {

@@ -41,12 +41,12 @@ type SignalMessage struct {
 }
 
 type Client struct {
-	id       string
-	role     string
-	ip       string
-	port     string
-	conn     *websocket.Conn
-	send     chan []byte
+	id   string
+	role string
+	ip   string
+	port string
+	conn *websocket.Conn
+	send chan []byte
 }
 
 type Hub struct {
@@ -288,7 +288,7 @@ func (c *Client) readPump(s *Server, ctx context.Context) {
 		case "leave":
 			s.hub.broadcast(c.id, payload, msg.Target)
 			return
-		case "offer", "answer", "ice":
+		case "offer", "answer", "ice", "control", "pli", "ping", "pong":
 			s.touchMember(ctx, c)
 			s.hub.broadcast(c.id, payload, msg.Target)
 		default:
@@ -379,10 +379,10 @@ func (s *Server) storeMember(ctx context.Context, c *Client) {
 
 	fields := map[string]any{
 		"client_id": c.id,
-		"role":     c.role,
-		"ip":       c.ip,
-		"port":     c.port,
-		"lastSeen": time.Now().UTC().Format(time.RFC3339),
+		"role":      c.role,
+		"ip":        c.ip,
+		"port":      c.port,
+		"lastSeen":  time.Now().UTC().Format(time.RFC3339),
 	}
 
 	_ = s.rdb.HSet(ctx, memberKey(c.id), fields).Err()
