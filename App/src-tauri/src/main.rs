@@ -11,19 +11,23 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, io};
 
 const ZTS_AF_INET: i32 = 2;
 const ZTS_SOCK_STREAM: i32 = 1;
+const ZTS_SOCK_DGRAM: i32 = 2;
 const ZTS_IP_MAX_STR_LEN: usize = 46;
 const SIGNAL_INBOX_LIMIT: usize = 2048;
+const MEDIA_PACKET_INBOX_LIMIT: usize = 4096;
+const MEDIA_MAX_BATCH_PACKETS: usize = 512;
 const LIBZT_EVENT_INBOX_LIMIT: usize = 1024;
-const NODE_ONLINE_WAIT_TRIES: usize = 16;
-const NODE_ONLINE_WAIT_INTERVAL_MS: u64 = 150;
-const IP_ASSIGN_WAIT_TRIES: usize = 12;
-const IP_ASSIGN_WAIT_INTERVAL_MS: u64 = 150;
-const LIBZT_CONNECT_TIMEOUT_MS: i32 = 8000;
+const NODE_ONLINE_WAIT_TRIES: usize = 6;
+const NODE_ONLINE_WAIT_INTERVAL_MS: u64 = 100;
+const IP_ASSIGN_WAIT_TRIES: usize = 6;
+const IP_ASSIGN_WAIT_INTERVAL_MS: u64 = 100;
+const LIBZT_SIGNAL_CONNECT_TIMEOUT_MS: i32 = 1200;
+const LIBZT_MEDIA_CONNECT_TIMEOUT_MS: i32 = 1200;
 
 #[repr(C)]
 struct ZtsEventMsg {
@@ -54,6 +58,8 @@ type ZtsAccept = unsafe extern "C" fn(i32, *mut c_char, i32, *mut u16) -> i32;
 type ZtsConnect = unsafe extern "C" fn(i32, *const c_char, u16, i32) -> i32;
 type ZtsSend = unsafe extern "C" fn(i32, *const c_void, usize, i32) -> isize;
 type ZtsRecv = unsafe extern "C" fn(i32, *mut c_void, usize, i32) -> isize;
+type ZtsSendTo = unsafe extern "C" fn(i32, *const c_void, usize, i32, *const c_char, u16) -> isize;
+type ZtsRecvFrom = unsafe extern "C" fn(i32, *mut c_void, usize, i32, *mut c_char, i32, *mut u16) -> isize;
 type ZtsClose = unsafe extern "C" fn(i32) -> i32;
 
 #[derive(Clone, Copy)]
@@ -65,6 +71,8 @@ struct LibztSocketApi {
     connect: ZtsConnect,
     send: ZtsSend,
     recv: ZtsRecv,
+    sendto: Option<ZtsSendTo>,
+    recvfrom: Option<ZtsRecvFrom>,
     close: ZtsClose,
 }
 
@@ -101,11 +109,26 @@ struct SignalRuntime {
     threads: Vec<thread::JoinHandle<()>>,
 }
 
+struct MediaPeer {
+    ip: String,
+    ip_cstr: CString,
+    port: u16,
+}
+
+struct MediaRuntime {
+    api: LibztSocketApi,
+    stop: Arc<AtomicBool>,
+    fd: Arc<AtomicI32>,
+    inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    peer: Arc<Mutex<Option<MediaPeer>>>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
 static LIBZT_RUNTIME: OnceLock<Mutex<Option<LibztRuntime>>> = OnceLock::new();
 static LIBZT_LOG_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static LIBZT_EVENT_INBOX: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 static SIGNAL_RUNTIME: OnceLock<Mutex<Option<SignalRuntime>>> = OnceLock::new();
-static MEDIA_RUNTIME: OnceLock<Mutex<Option<SignalRuntime>>> = OnceLock::new();
+static MEDIA_RUNTIME: OnceLock<Mutex<Option<MediaRuntime>>> = OnceLock::new();
 
 fn runtime_slot() -> &'static Mutex<Option<LibztRuntime>> {
     LIBZT_RUNTIME.get_or_init(|| Mutex::new(None))
@@ -123,7 +146,7 @@ fn signal_slot() -> &'static Mutex<Option<SignalRuntime>> {
     SIGNAL_RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
-fn media_slot() -> &'static Mutex<Option<SignalRuntime>> {
+fn media_slot() -> &'static Mutex<Option<MediaRuntime>> {
     MEDIA_RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
@@ -206,6 +229,12 @@ unsafe fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, Stri
     Ok(*symbol)
 }
 
+unsafe fn load_optional_symbol<T: Copy>(library: &Library, name: &[u8]) -> Option<T> {
+    // SAFETY: optional symbol lookup for compatibility with older libzt builds.
+    let symbol: Result<Symbol<T>, _> = unsafe { library.get(name) };
+    symbol.ok().map(|s| *s)
+}
+
 fn load_libzt_api(dll_path: &Path) -> Result<LibztApi, String> {
     let library = {
         // SAFETY: loading user-provided shared library path for runtime FFI calls
@@ -273,6 +302,19 @@ fn load_libzt_api(dll_path: &Path) -> Result<LibztApi, String> {
         // SAFETY: symbol signatures are matched to ZeroTier C API declarations
         unsafe { load_symbol::<ZtsRecv>(&library, b"zts_recv\0") }?
     };
+    let sendto = {
+        // SAFETY: optional symbol for compatibility with old libzt binaries.
+        unsafe { load_optional_symbol::<ZtsSendTo>(&library, b"zts_sendto\0") }
+    };
+    let recvfrom = {
+        // SAFETY: optional symbol for compatibility with old libzt binaries.
+        unsafe { load_optional_symbol::<ZtsRecvFrom>(&library, b"zts_recvfrom\0") }
+    };
+    if sendto.is_none() || recvfrom.is_none() {
+        append_libzt_log_line(
+            "libzt optional symbols missing (zts_sendto/zts_recvfrom), fallback to connect+send/recv mode",
+        );
+    }
     let close = {
         // SAFETY: symbol signatures are matched to ZeroTier C API declarations
         unsafe { load_symbol::<ZtsClose>(&library, b"zts_close\0") }?
@@ -296,6 +338,8 @@ fn load_libzt_api(dll_path: &Path) -> Result<LibztApi, String> {
             connect,
             send,
             recv,
+            sendto,
+            recvfrom,
             close,
         },
     })
@@ -542,6 +586,124 @@ fn join_runtime_threads(mut threads: Vec<thread::JoinHandle<()>>) {
     }
 }
 
+// 将收到的媒体 UDP 包写入内存队列，队列满时丢弃最旧数据。
+fn push_media_packet(inbox: &Arc<Mutex<VecDeque<Vec<u8>>>>, packet: Vec<u8>) {
+    if let Ok(mut guard) = inbox.lock() {
+        if guard.len() >= MEDIA_PACKET_INBOX_LIMIT {
+            guard.pop_front();
+        }
+        guard.push_back(packet);
+    }
+}
+
+// 构造媒体对端地址信息（同时缓存 C 字符串供 FFI 发送使用）。
+fn make_media_peer(ip: String, port: u16) -> Result<MediaPeer, String> {
+    if ip.trim().is_empty() {
+        return Err("media peer ip is empty".to_string());
+    }
+    let ip_cstr = CString::new(ip.clone()).map_err(|e| format!("invalid media peer ip: {e}"))?;
+    Ok(MediaPeer { ip, ip_cstr, port })
+}
+
+// 设置或更新当前媒体发送对端。
+fn set_media_peer(
+    api: &LibztSocketApi,
+    fd_slot: &Arc<AtomicI32>,
+    peer_slot: &Arc<Mutex<Option<MediaPeer>>>,
+    ip: String,
+    port: u16,
+) -> Result<(), String> {
+    let peer = make_media_peer(ip, port)?;
+    connect_media_peer_if_needed(api, fd_slot, &peer)?;
+    let mut guard = peer_slot
+        .lock()
+        .map_err(|_| "media peer lock poisoned".to_string())?;
+    *guard = Some(peer);
+    Ok(())
+}
+
+fn connect_media_peer_if_needed(
+    api: &LibztSocketApi,
+    fd_slot: &Arc<AtomicI32>,
+    peer: &MediaPeer,
+) -> Result<(), String> {
+    if api.sendto.is_some() {
+        return Ok(());
+    }
+    let fd = fd_slot.load(Ordering::SeqCst);
+    if fd < 0 {
+        return Err("media socket is not opened".to_string());
+    }
+    // SAFETY: fd is a valid UDP socket and peer endpoint has been validated.
+    let ret = unsafe {
+        (api.connect)(
+            fd,
+            peer.ip_cstr.as_ptr(),
+            peer.port,
+            LIBZT_MEDIA_CONNECT_TIMEOUT_MS,
+        )
+    };
+    if ret < 0 {
+        return Err(format!("media zts_connect(dgram peer) failed: {ret}"));
+    }
+    Ok(())
+}
+
+// 底层发送函数：按当前 fd 和 peer 使用 zts_sendto 发送单个 UDP 包。
+fn media_send_packet_by_parts(
+    api: &LibztSocketApi,
+    fd_slot: &Arc<AtomicI32>,
+    peer_slot: &Arc<Mutex<Option<MediaPeer>>>,
+    payload: &[u8],
+) -> Result<(), String> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+    let fd = fd_slot.load(Ordering::SeqCst);
+    if fd < 0 {
+        return Err("media socket is not opened".to_string());
+    }
+
+    let peer_guard = peer_slot
+        .lock()
+        .map_err(|_| "media peer lock poisoned".to_string())?;
+    let peer = peer_guard
+        .as_ref()
+        .ok_or_else(|| "media peer is unknown".to_string())?;
+
+    // SAFETY: fd/socket and payload pointers are valid at this point.
+    let sent = unsafe {
+        if let Some(sendto) = api.sendto {
+            sendto(
+                fd,
+                payload.as_ptr() as *const c_void,
+                payload.len(),
+                0,
+                peer.ip_cstr.as_ptr(),
+                peer.port,
+            )
+        } else {
+            (api.send)(fd, payload.as_ptr() as *const c_void, payload.len(), 0)
+        }
+    };
+    if sent < 0 {
+        return Err(format!("media send failed: {sent}"));
+    }
+    if sent as usize != payload.len() {
+        return Err(format!(
+            "media partial send: sent={}, expected={}",
+            sent,
+            payload.len()
+        ));
+    }
+    Ok(())
+}
+
+// 对外发送封装：从媒体运行时取参数并发送单包。
+fn media_send_packet(runtime: &MediaRuntime, payload: &[u8]) -> Result<(), String> {
+    media_send_packet_by_parts(&runtime.api, &runtime.fd, &runtime.peer, payload)
+}
+
 fn join_runtime_threads_async(threads: Vec<thread::JoinHandle<()>>) {
     thread::spawn(move || {
         join_runtime_threads(threads);
@@ -733,7 +895,14 @@ fn zt_signal_connect(peer_ip: String, port: u16) -> Result<(), String> {
 
     let peer_cstr = CString::new(peer_ip.clone()).map_err(|e| format!("invalid peer_ip: {e}"))?;
     // SAFETY: passing valid socket descriptor and peer endpoint to libzt
-    let connect_ret = unsafe { (api.connect)(fd, peer_cstr.as_ptr(), port, LIBZT_CONNECT_TIMEOUT_MS) };
+    let connect_ret = unsafe {
+        (api.connect)(
+            fd,
+            peer_cstr.as_ptr(),
+            port,
+            LIBZT_SIGNAL_CONNECT_TIMEOUT_MS,
+        )
+    };
     if connect_ret < 0 {
         zt_close_fd(&api, fd);
         return Err(format!("zts_connect failed: code={connect_ret}"));
@@ -842,6 +1011,7 @@ fn zt_signal_close() -> Result<(), String> {
     zt_signal_close_internal(false)
 }
 
+// 关闭媒体运行时：停止线程并关闭 UDP fd。
 fn zt_media_close_internal(wait_threads: bool) -> Result<(), String> {
     let mut guard = media_slot()
         .lock()
@@ -852,10 +1022,8 @@ fn zt_media_close_internal(wait_threads: bool) -> Result<(), String> {
 
     runtime.stop.store(true, Ordering::SeqCst);
 
-    let conn_fd = runtime.conn_fd.swap(-1, Ordering::SeqCst);
-    let listen_fd = runtime.listen_fd.swap(-1, Ordering::SeqCst);
-    zt_close_fd(&runtime.api, conn_fd);
-    zt_close_fd(&runtime.api, listen_fd);
+    let fd = runtime.fd.swap(-1, Ordering::SeqCst);
+    zt_close_fd(&runtime.api, fd);
 
     let threads = std::mem::take(&mut runtime.threads);
     if wait_threads {
@@ -868,136 +1036,116 @@ fn zt_media_close_internal(wait_threads: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn zt_media_listen(port: u16) -> Result<(), String> {
-    if port == 0 {
-        return Err("invalid media port".to_string());
-    }
-
+// 启动媒体运行时：创建并绑定 UDP socket，启动接收线程并维护 peer 信息。
+fn start_media_runtime(bind_port: u16, preset_peer: Option<(String, u16)>) -> Result<(), String> {
     zt_media_close_internal(false)?;
 
     let api = get_socket_api()?;
     let stop = Arc::new(AtomicBool::new(false));
-    let listen_fd = Arc::new(AtomicI32::new(-1));
-    let conn_fd = Arc::new(AtomicI32::new(-1));
-    let inbox = Arc::new(Mutex::new(VecDeque::new()));
+    let fd_slot = Arc::new(AtomicI32::new(-1));
+    let inbox = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
+    let peer = Arc::new(Mutex::new(None));
 
-    let thread_api = api;
-    let thread_stop = Arc::clone(&stop);
-    let thread_listen_fd = Arc::clone(&listen_fd);
-    let thread_conn_fd = Arc::clone(&conn_fd);
-    let thread_inbox = Arc::clone(&inbox);
+    // SAFETY: creating a libzt UDP socket with valid family/type values
+    let fd = unsafe { (api.socket)(ZTS_AF_INET, ZTS_SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(format!("media zts_socket(dgram) failed: {fd}"));
+    }
 
-    let listener = thread::spawn(move || {
-        // SAFETY: creating a libzt TCP socket with valid family/type values
-        let fd = unsafe { (thread_api.socket)(ZTS_AF_INET, ZTS_SOCK_STREAM, 0) };
-        if fd < 0 {
-            push_sys_event(
-                &thread_inbox,
-                "error",
-                &format!("media zts_socket failed: {fd}"),
-            );
-            return;
-        }
+    let any_ip = CString::new("0.0.0.0").expect("valid static ip");
+    // SAFETY: passing a valid C string and socket descriptor to libzt
+    let bind_ret = unsafe { (api.bind)(fd, any_ip.as_ptr(), bind_port) };
+    if bind_ret < 0 {
+        zt_close_fd(&api, fd);
+        return Err(format!("media zts_bind failed: {bind_ret}"));
+    }
 
-        let any_ip = CString::new("0.0.0.0").expect("valid static ip");
-        // SAFETY: passing a valid C string and socket descriptor to libzt
-        let bind_ret = unsafe { (thread_api.bind)(fd, any_ip.as_ptr(), port) };
-        if bind_ret < 0 {
-            push_sys_event(
-                &thread_inbox,
-                "error",
-                &format!("media zts_bind failed: {bind_ret}"),
-            );
-            zt_close_fd(&thread_api, fd);
-            return;
-        }
+    fd_slot.store(fd, Ordering::SeqCst);
 
-        // SAFETY: valid socket descriptor and backlog
-        let listen_ret = unsafe { (thread_api.listen)(fd, 2) };
-        if listen_ret < 0 {
-            push_sys_event(
-                &thread_inbox,
-                "error",
-                &format!("media zts_listen failed: {listen_ret}"),
-            );
-            zt_close_fd(&thread_api, fd);
-            return;
-        }
+    if let Some((peer_ip, peer_port)) = preset_peer {
+        set_media_peer(&api, &fd_slot, &peer, peer_ip, peer_port)?;
+    }
 
-        thread_listen_fd.store(fd, Ordering::SeqCst);
-        push_sys_event(
-            &thread_inbox,
-            "listener_started",
-            &format!("media listening on 0.0.0.0:{port}"),
-        );
-
-        while !thread_stop.load(Ordering::SeqCst) {
+    let recv_api = api;
+    let recv_stop = Arc::clone(&stop);
+    let recv_fd_slot = Arc::clone(&fd_slot);
+    let recv_inbox = Arc::clone(&inbox);
+    let recv_peer = Arc::clone(&peer);
+    let recv_thread = thread::spawn(move || {
+        let mut buffer = [0_u8; 2048];
+        while !recv_stop.load(Ordering::SeqCst) {
+            let current_fd = recv_fd_slot.load(Ordering::SeqCst);
+            if current_fd < 0 {
+                break;
+            }
             let mut remote = [0_i8; ZTS_IP_MAX_STR_LEN + 1];
             let mut remote_port = 0_u16;
-
-            // SAFETY: accept buffer is writable and properly sized
-            let client_fd = unsafe {
-                (thread_api.accept)(
-                    fd,
-                    remote.as_mut_ptr(),
-                    ZTS_IP_MAX_STR_LEN as i32,
-                    &mut remote_port,
-                )
+            let n = if let Some(recvfrom) = recv_api.recvfrom {
+                // SAFETY: recvfrom writes into valid mutable buffers.
+                unsafe {
+                    recvfrom(
+                        current_fd,
+                        buffer.as_mut_ptr() as *mut c_void,
+                        buffer.len(),
+                        0,
+                        remote.as_mut_ptr(),
+                        ZTS_IP_MAX_STR_LEN as i32,
+                        &mut remote_port,
+                    )
+                }
+            } else {
+                // SAFETY: recv writes into a valid mutable buffer.
+                unsafe { (recv_api.recv)(current_fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) }
             };
 
-            if client_fd < 0 {
-                if thread_stop.load(Ordering::SeqCst) {
-                    break;
+            if n > 0 {
+                let packet = buffer[..n as usize].to_vec();
+                push_media_packet(&recv_inbox, packet);
+
+                if remote[0] != 0 {
+                    let remote_ip = unsafe { CStr::from_ptr(remote.as_ptr()) }
+                        .to_string_lossy()
+                        .to_string();
+                    if !remote_ip.is_empty() {
+                        if let Ok(mut guard) = recv_peer.lock() {
+                            let should_update = guard
+                                .as_ref()
+                                .map(|p| p.ip != remote_ip || p.port != remote_port)
+                                .unwrap_or(true);
+                            if should_update {
+                                if let Ok(new_peer) = make_media_peer(remote_ip.clone(), remote_port)
+                                {
+                                    *guard = Some(new_peer);
+                                }
+                            }
+                        }
+                    }
                 }
-                thread::sleep(Duration::from_millis(200));
                 continue;
             }
 
-            let old = thread_conn_fd.swap(client_fd, Ordering::SeqCst);
-            if old >= 0 {
-                zt_close_fd(&thread_api, old);
+            if n == 0 {
+                thread::sleep(Duration::from_millis(1));
+                continue;
             }
 
-            let remote_ip = if remote[0] == 0 {
-                "unknown".to_string()
-            } else {
-                // SAFETY: libzt accept writes a null-terminated IPv4/IPv6 string
-                unsafe { CStr::from_ptr(remote.as_ptr()) }
-                    .to_string_lossy()
-                    .to_string()
-            };
-            push_sys_event(
-                &thread_inbox,
-                "connected",
-                &format!("media viewer connected from {remote_ip}:{remote_port}"),
-            );
-
-            let recv_handle = spawn_recv_thread(
-                thread_api,
-                Arc::clone(&thread_stop),
-                Arc::clone(&thread_conn_fd),
-                Arc::clone(&thread_inbox),
-                client_fd,
-                "media",
-            );
-            let _ = recv_handle.join();
+            if recv_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
         }
 
-        let active_conn = thread_conn_fd.swap(-1, Ordering::SeqCst);
-        let active_listener = thread_listen_fd.swap(-1, Ordering::SeqCst);
-        zt_close_fd(&thread_api, active_conn);
-        zt_close_fd(&thread_api, active_listener);
-        push_sys_event(&thread_inbox, "listener_stopped", "media listener stopped");
+        let closed_fd = recv_fd_slot.swap(-1, Ordering::SeqCst);
+        zt_close_fd(&recv_api, closed_fd);
     });
 
-    let runtime = SignalRuntime {
+    let runtime = MediaRuntime {
         api,
         stop,
-        listen_fd,
-        conn_fd,
+        fd: fd_slot,
         inbox,
-        threads: vec![listener],
+        peer,
+        threads: vec![recv_thread],
     };
 
     let mut guard = media_slot()
@@ -1005,11 +1153,21 @@ fn zt_media_listen(port: u16) -> Result<(), String> {
         .map_err(|_| "media runtime lock poisoned".to_string())?;
     *guard = Some(runtime);
 
-    append_libzt_log_line(&format!("media listener initialized on {port}"));
+    append_libzt_log_line(&format!("media udp opened on 0.0.0.0:{bind_port}"));
     Ok(())
 }
 
 #[tauri::command]
+// 共享端入口：监听本地媒体 UDP 端口。
+fn zt_media_listen(port: u16) -> Result<(), String> {
+    if port == 0 {
+        return Err("invalid media port".to_string());
+    }
+    start_media_runtime(port, None)
+}
+
+#[tauri::command]
+// 观看端入口：启动本地 UDP 并预设远端 peer 地址。
 fn zt_media_connect(peer_ip: String, port: u16) -> Result<(), String> {
     if port == 0 {
         return Err("invalid media port".to_string());
@@ -1018,101 +1176,95 @@ fn zt_media_connect(peer_ip: String, port: u16) -> Result<(), String> {
     if peer_ip.is_empty() {
         return Err("peer_ip is empty".to_string());
     }
-
-    zt_media_close_internal(false)?;
-
-    let api = get_socket_api()?;
-
-    // SAFETY: creating a libzt TCP socket with valid family/type values
-    let fd = unsafe { (api.socket)(ZTS_AF_INET, ZTS_SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(format!("media zts_socket failed: {fd}"));
-    }
-
-    let peer_cstr = CString::new(peer_ip.clone()).map_err(|e| format!("invalid peer_ip: {e}"))?;
-    // SAFETY: passing valid socket descriptor and peer endpoint to libzt
-    let connect_ret = unsafe { (api.connect)(fd, peer_cstr.as_ptr(), port, LIBZT_CONNECT_TIMEOUT_MS) };
-    if connect_ret < 0 {
-        zt_close_fd(&api, fd);
-        return Err(format!("media zts_connect failed: code={connect_ret}"));
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let listen_fd = Arc::new(AtomicI32::new(-1));
-    let conn_fd = Arc::new(AtomicI32::new(fd));
-    let inbox = Arc::new(Mutex::new(VecDeque::new()));
-
-    push_sys_event(
-        &inbox,
-        "connected",
-        &format!("media connected to sharer {peer_ip}:{port}"),
-    );
-
-    let recv_handle = spawn_recv_thread(
-        api,
-        Arc::clone(&stop),
-        Arc::clone(&conn_fd),
-        Arc::clone(&inbox),
-        fd,
-        "media",
-    );
-
-    let runtime = SignalRuntime {
-        api,
-        stop,
-        listen_fd,
-        conn_fd,
-        inbox,
-        threads: vec![recv_handle],
-    };
-
-    let mut guard = media_slot()
-        .lock()
-        .map_err(|_| "media runtime lock poisoned".to_string())?;
-    *guard = Some(runtime);
-
-    append_libzt_log_line(&format!("media connected to {peer_ip}:{port}"));
-    Ok(())
+    start_media_runtime(port, Some((peer_ip, port)))
 }
 
 #[tauri::command]
-fn zt_media_send(payload: String) -> Result<(), String> {
-    if payload.trim().is_empty() {
+// 运行中动态修改媒体 peer（用于地址变化或首次学习后覆盖）。
+fn zt_media_set_peer(peer_ip: String, port: u16) -> Result<(), String> {
+    if port == 0 {
+        return Err("invalid media peer port".to_string());
+    }
+    let peer_ip = peer_ip.trim().to_string();
+    if peer_ip.is_empty() {
+        return Err("peer_ip is empty".to_string());
+    }
+
+    let guard = media_slot()
+        .lock()
+        .map_err(|_| "media runtime lock poisoned".to_string())?;
+    let runtime = guard
+        .as_ref()
+        .ok_or_else(|| "media runtime is not initialized".to_string())?;
+    set_media_peer(&runtime.api, &runtime.fd, &runtime.peer, peer_ip, port)
+}
+
+#[tauri::command]
+// 发送单个媒体 UDP 包。
+fn zt_media_send(payload: Vec<u8>) -> Result<(), String> {
+    if payload.is_empty() {
         return Ok(());
     }
 
-    let (api, conn_fd, inbox) = {
+    let guard = media_slot()
+        .lock()
+        .map_err(|_| "media runtime lock poisoned".to_string())?;
+    let runtime = guard
+        .as_ref()
+        .ok_or_else(|| "media runtime is not initialized".to_string())?;
+    media_send_packet(runtime, &payload)
+}
+
+#[tauri::command]
+// 按批次发送媒体 UDP 包，并在 spread_ms 窗口内做 pacing。
+fn zt_media_send_batch(packets: Vec<Vec<u8>>, spread_ms: u16) -> Result<(), String> {
+    if packets.is_empty() {
+        return Ok(());
+    }
+    if packets.len() > MEDIA_MAX_BATCH_PACKETS {
+        return Err(format!(
+            "media packet batch too large: {} (max={MEDIA_MAX_BATCH_PACKETS})",
+            packets.len()
+        ));
+    }
+
+    let (api, fd_slot, peer_slot) = {
         let guard = media_slot()
             .lock()
             .map_err(|_| "media runtime lock poisoned".to_string())?;
         let runtime = guard
             .as_ref()
             .ok_or_else(|| "media runtime is not initialized".to_string())?;
-        (
-            runtime.api,
-            Arc::clone(&runtime.conn_fd),
-            Arc::clone(&runtime.inbox),
-        )
+        (runtime.api, Arc::clone(&runtime.fd), Arc::clone(&runtime.peer))
     };
 
-    let fd = conn_fd.load(Ordering::SeqCst);
-    if fd < 0 {
-        return Err("media peer is not connected".to_string());
-    }
+    let interval_ns = if packets.len() > 1 {
+        let span_ns = u128::from(spread_ms) * 1_000_000u128;
+        (span_ns / (packets.len() as u128 - 1)).min(u64::MAX as u128) as u64
+    } else {
+        0
+    };
+    let pacing_start = Instant::now();
 
-    let mut bytes = payload.into_bytes();
-    bytes.push(b'\n');
+    for (idx, packet) in packets.iter().enumerate() {
+        if interval_ns > 0 && idx > 0 {
+            let target_at =
+                pacing_start + Duration::from_nanos(interval_ns.saturating_mul(idx as u64));
+            let now = Instant::now();
+            if target_at > now {
+                thread::sleep(target_at.duration_since(now));
+            }
+        }
 
-    if let Err(err) = zt_send_all(&api, fd, &bytes) {
-        push_sys_event(&inbox, "error", &format!("media send failed: {err}"));
-        return Err(err);
+        media_send_packet_by_parts(&api, &fd_slot, &peer_slot, packet)?;
     }
 
     Ok(())
 }
 
 #[tauri::command]
-fn zt_media_poll() -> Result<Vec<String>, String> {
+// 轮询拉取已接收的媒体 UDP 包（一次最多返回固定上限）。
+fn zt_media_poll() -> Result<Vec<Vec<u8>>, String> {
     let inbox = {
         let guard = media_slot()
             .lock()
@@ -1127,15 +1279,19 @@ fn zt_media_poll() -> Result<Vec<String>, String> {
         .lock()
         .map_err(|_| "media inbox lock poisoned".to_string())?;
 
-    let mut out = Vec::with_capacity(queue.len());
+    let mut out = Vec::with_capacity(queue.len().min(MEDIA_MAX_BATCH_PACKETS));
     while let Some(item) = queue.pop_front() {
         out.push(item);
+        if out.len() >= MEDIA_MAX_BATCH_PACKETS {
+            break;
+        }
     }
 
     Ok(out)
 }
 
 #[tauri::command]
+// 对外关闭媒体通道命令。
 fn zt_media_close() -> Result<(), String> {
     zt_media_close_internal(false)
 }
@@ -1397,7 +1553,9 @@ fn main() {
             zt_signal_close,
             zt_media_listen,
             zt_media_connect,
+            zt_media_set_peer,
             zt_media_send,
+            zt_media_send_batch,
             zt_media_poll,
             zt_media_close
         ])
