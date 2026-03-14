@@ -1,7 +1,9 @@
 日志
+.codex_tools
 App/node_modules
 App/logs
 App/dist
 App/src-tauri/target
+Gin
 Gin/logs
 Gin/.env

@@ -4,15 +4,32 @@ use libloading::{Library, Symbol};
 use serde_json::json;
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::fs::{create_dir_all, OpenOptions};
-use std::io::Write;
+use std::fs::{create_dir_all, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, io};
+
+#[path = "module/media.rs"]
+mod media;
+#[path = "module/runtime.rs"]
+mod runtime;
+#[path = "module/signal.rs"]
+mod signal;
+
+pub(crate) use media::*;
+pub(crate) use runtime::*;
+pub(crate) use signal::*;
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GetLastError() -> u32;
+    fn SetLastError(dwErrCode: u32);
+}
 
 const ZTS_AF_INET: i32 = 2;
 const ZTS_SOCK_STREAM: i32 = 1;
@@ -21,6 +38,7 @@ const ZTS_IP_MAX_STR_LEN: usize = 46;
 const SIGNAL_INBOX_LIMIT: usize = 2048;
 const MEDIA_PACKET_INBOX_LIMIT: usize = 4096;
 const MEDIA_MAX_BATCH_PACKETS: usize = 512;
+const MEDIA_SEND_BATCH_QUEUE_LIMIT: usize = 128;
 const LIBZT_EVENT_INBOX_LIMIT: usize = 1024;
 const NODE_ONLINE_WAIT_TRIES: usize = 6;
 const NODE_ONLINE_WAIT_INTERVAL_MS: u64 = 100;
@@ -121,7 +139,19 @@ struct MediaRuntime {
     fd: Arc<AtomicI32>,
     inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
     peer: Arc<Mutex<Option<MediaPeer>>>,
+    send_queue: Arc<MediaSendQueue>,
     threads: Vec<thread::JoinHandle<()>>,
+}
+
+struct MediaSendBatch {
+    packets: Vec<Vec<u8>>,
+    spread_ms: u16,
+    priority: u8,
+}
+
+struct MediaSendQueue {
+    queue: Mutex<VecDeque<MediaSendBatch>>,
+    cv: Condvar,
 }
 
 static LIBZT_RUNTIME: OnceLock<Mutex<Option<LibztRuntime>>> = OnceLock::new();
@@ -148,6 +178,13 @@ fn signal_slot() -> &'static Mutex<Option<SignalRuntime>> {
 
 fn media_slot() -> &'static Mutex<Option<MediaRuntime>> {
     MEDIA_RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+fn media_send_queue_slot() -> Arc<MediaSendQueue> {
+    Arc::new(MediaSendQueue {
+        queue: Mutex::new(VecDeque::new()),
+        cv: Condvar::new(),
+    })
 }
 
 fn set_libzt_log_path(path: PathBuf) {
@@ -235,10 +272,169 @@ unsafe fn load_optional_symbol<T: Copy>(library: &Library, name: &[u8]) -> Optio
     symbol.ok().map(|s| *s)
 }
 
+fn current_process_arch_label() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x64"
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        "x86"
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "arm64"
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    {
+        "unknown"
+    }
+}
+
+fn read_pe_machine(path: &Path) -> io::Result<Option<u16>> {
+    let mut file = File::open(path)?;
+
+    let mut dos_header = [0u8; 64];
+    file.read_exact(&mut dos_header)?;
+    if &dos_header[0..2] != b"MZ" {
+        return Ok(None);
+    }
+
+    let pe_offset = u32::from_le_bytes([
+        dos_header[0x3c],
+        dos_header[0x3d],
+        dos_header[0x3e],
+        dos_header[0x3f],
+    ]) as u64;
+
+    file.seek(SeekFrom::Start(pe_offset))?;
+    let mut pe_sig = [0u8; 4];
+    file.read_exact(&mut pe_sig)?;
+    if &pe_sig != b"PE\0\0" {
+        return Ok(None);
+    }
+
+    let mut machine = [0u8; 2];
+    file.read_exact(&mut machine)?;
+    Ok(Some(u16::from_le_bytes(machine)))
+}
+
+fn pe_machine_label(machine: u16) -> &'static str {
+    match machine {
+        0x014c => "x86",
+        0x8664 => "x64",
+        0xaa64 => "arm64",
+        _ => "unknown",
+    }
+}
+
+fn expected_pe_machine() -> Option<u16> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        Some(0x8664)
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        Some(0x014c)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        Some(0xaa64)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn reset_last_win32_error() {
+    // SAFETY: resets thread-local Win32 last-error state before a DLL load attempt.
+    unsafe { SetLastError(0) };
+}
+
+#[cfg(not(windows))]
+fn reset_last_win32_error() {}
+
+#[cfg(windows)]
+fn last_win32_error_code() -> Option<u32> {
+    // SAFETY: reads thread-local Win32 last-error state immediately after a failed DLL load.
+    let code = unsafe { GetLastError() };
+    (code != 0).then_some(code)
+}
+
+#[cfg(not(windows))]
+fn last_win32_error_code() -> Option<u32> {
+    None
+}
+
+fn diagnose_libzt_load_failure(dll_path: &Path, err_text: &str, win32_code: Option<u32>) -> String {
+    if !dll_path.exists() {
+        return format!("path missing: {}", dll_path.display());
+    }
+
+    let mut reasons: Vec<String> = Vec::new();
+
+    match std::fs::metadata(dll_path) {
+        Ok(meta) => reasons.push(format!("file exists, size={} bytes", meta.len())),
+        Err(e) => reasons.push(format!("metadata unavailable: {e}")),
+    }
+
+    if let Some(code) = win32_code {
+        reasons.push(format!("win32={code}"));
+    }
+
+    match read_pe_machine(dll_path) {
+        Ok(Some(machine)) => {
+            reasons.push(format!(
+                "dll arch={} (0x{machine:04x})",
+                pe_machine_label(machine)
+            ));
+            if let Some(expected) = expected_pe_machine() {
+                reasons.push(format!(
+                    "process arch={} (0x{expected:04x})",
+                    current_process_arch_label()
+                ));
+                if machine != expected {
+                    reasons.push("likely cause: DLL bitness/architecture mismatch".to_string());
+                }
+            }
+        }
+        Ok(None) => {
+            reasons.push("dll is not a valid PE file or PE header is unreadable".to_string());
+        }
+        Err(e) => {
+            reasons.push(format!("failed to inspect PE header: {e}"));
+        }
+    }
+
+    let lower = err_text.to_ascii_lowercase();
+    if win32_code == Some(126) || lower.contains("126") || lower.contains("module could not be found") {
+        reasons.push(
+            "likely cause: dependent DLL missing (target DLL exists but one of its dependencies does not)"
+                .to_string(),
+        );
+    } else if win32_code == Some(193) || lower.contains("193") || lower.contains("not a valid win32 application") {
+        reasons.push("likely cause: DLL architecture mismatch or corrupted binary".to_string());
+    } else if win32_code == Some(5) || lower.contains("5") || lower.contains("access is denied") {
+        reasons.push("likely cause: access denied or file blocked by security policy".to_string());
+    } else if win32_code == Some(1114) || lower.contains("1114") {
+        reasons.push("likely cause: DLL initialization routine failed".to_string());
+    }
+
+    reasons.join("; ")
+}
+
 fn load_libzt_api(dll_path: &Path) -> Result<LibztApi, String> {
+    reset_last_win32_error();
     let library = {
         // SAFETY: loading user-provided shared library path for runtime FFI calls
-        unsafe { Library::new(dll_path) }.map_err(|e| format!("load dll failed: {e}"))?
+        unsafe { Library::new(dll_path) }.map_err(|e| {
+            let raw = e.to_string();
+            let win32_code = last_win32_error_code();
+            let diagnostics = diagnose_libzt_load_failure(dll_path, &raw, win32_code);
+            format!("load dll failed: {raw} | diagnostics: {diagnostics}")
+        })?
     };
 
     let init_set_event_handler = {
@@ -596,6 +792,56 @@ fn push_media_packet(inbox: &Arc<Mutex<VecDeque<Vec<u8>>>>, packet: Vec<u8>) {
     }
 }
 
+fn classify_media_batch_priority(tag: &str, packet_count: usize, spread_ms: u16) -> u8 {
+    match tag {
+        "control" => 3,
+        "keyframe" | "retransmit" => 2,
+        "nack" => 1,
+        _ if packet_count <= 4 && spread_ms <= 10 => 1,
+        _ => 0,
+    }
+}
+
+fn enqueue_media_send_batch(
+    queue: &Arc<MediaSendQueue>,
+    batch: MediaSendBatch,
+) -> Result<(), String> {
+    let mut guard = queue
+        .queue
+        .lock()
+        .map_err(|_| "media send queue lock poisoned".to_string())?;
+
+    if guard.len() >= MEDIA_SEND_BATCH_QUEUE_LIMIT {
+        let mut drop_index = None;
+        let mut min_priority = u8::MAX;
+        for (idx, item) in guard.iter().enumerate() {
+            if item.priority < min_priority {
+                min_priority = item.priority;
+                drop_index = Some(idx);
+            }
+        }
+
+        if let Some(idx) = drop_index.filter(|_| min_priority < batch.priority) {
+            guard.remove(idx);
+            append_libzt_log_line("media send queue full, evicted a lower-priority queued batch");
+        } else if batch.priority == 0 {
+            append_libzt_log_line("media send queue full, dropped one non-priority batch");
+            return Ok(());
+        } else {
+            append_libzt_log_line("media send queue full, dropped one queued batch with matching priority");
+            return Ok(());
+        }
+    }
+
+    if batch.priority >= 2 {
+        guard.push_front(batch);
+    } else {
+        guard.push_back(batch);
+    }
+    queue.cv.notify_one();
+    Ok(())
+}
+
 // 构造媒体对端地址信息（同时缓存 C 字符串供 FFI 发送使用）。
 fn make_media_peer(ip: String, port: u16) -> Result<MediaPeer, String> {
     if ip.trim().is_empty() {
@@ -704,736 +950,76 @@ fn media_send_packet(runtime: &MediaRuntime, payload: &[u8]) -> Result<(), Strin
     media_send_packet_by_parts(&runtime.api, &runtime.fd, &runtime.peer, payload)
 }
 
+fn spawn_media_send_thread(
+    api: LibztSocketApi,
+    stop: Arc<AtomicBool>,
+    fd_slot: Arc<AtomicI32>,
+    peer_slot: Arc<Mutex<Option<MediaPeer>>>,
+    send_queue: Arc<MediaSendQueue>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        let batch = {
+            let mut guard = match send_queue.queue.lock() {
+                Ok(guard) => guard,
+                Err(_) => break,
+            };
+
+            while guard.is_empty() && !stop.load(Ordering::SeqCst) {
+                guard = match send_queue.cv.wait(guard) {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+            }
+
+            if stop.load(Ordering::SeqCst) && guard.is_empty() {
+                break;
+            }
+
+            guard.pop_front()
+        };
+
+        let Some(batch) = batch else {
+            continue;
+        };
+
+        let interval_ns = if batch.packets.len() > 1 {
+            let span_ns = u128::from(batch.spread_ms) * 1_000_000u128;
+            (span_ns / (batch.packets.len() as u128 - 1)).min(u64::MAX as u128) as u64
+        } else {
+            0
+        };
+        let pacing_start = Instant::now();
+
+        for (idx, packet) in batch.packets.iter().enumerate() {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if interval_ns > 0 && idx > 0 {
+                let target_at =
+                    pacing_start + Duration::from_nanos(interval_ns.saturating_mul(idx as u64));
+                let now = Instant::now();
+                if target_at > now {
+                    thread::sleep(target_at.duration_since(now));
+                }
+            }
+
+            if let Err(err) = media_send_packet_by_parts(&api, &fd_slot, &peer_slot, packet) {
+                if !stop.load(Ordering::SeqCst) {
+                    append_libzt_log_line(&format!("media send worker error: {err}"));
+                }
+                break;
+            }
+        }
+    })
+}
+
 fn join_runtime_threads_async(threads: Vec<thread::JoinHandle<()>>) {
     thread::spawn(move || {
         join_runtime_threads(threads);
     });
 }
 
-fn zt_signal_close_internal(wait_threads: bool) -> Result<(), String> {
-    let mut guard = signal_slot()
-        .lock()
-        .map_err(|_| "signal runtime lock poisoned".to_string())?;
-    let Some(mut runtime) = guard.take() else {
-        return Ok(());
-    };
-
-    runtime.stop.store(true, Ordering::SeqCst);
-
-    let conn_fd = runtime.conn_fd.swap(-1, Ordering::SeqCst);
-    let listen_fd = runtime.listen_fd.swap(-1, Ordering::SeqCst);
-    zt_close_fd(&runtime.api, conn_fd);
-    zt_close_fd(&runtime.api, listen_fd);
-
-    let threads = std::mem::take(&mut runtime.threads);
-    if wait_threads {
-        join_runtime_threads(threads);
-    } else {
-        join_runtime_threads_async(threads);
-    }
-
-    append_libzt_log_line("signal runtime closed");
-    Ok(())
-}
-
-#[tauri::command]
-fn zt_signal_listen(port: u16) -> Result<(), String> {
-    if port == 0 {
-        return Err("invalid signal port".to_string());
-    }
-
-    zt_signal_close_internal(false)?;
-
-    let api = get_socket_api()?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let listen_fd = Arc::new(AtomicI32::new(-1));
-    let conn_fd = Arc::new(AtomicI32::new(-1));
-    let inbox = Arc::new(Mutex::new(VecDeque::new()));
-
-    let thread_api = api;
-    let thread_stop = Arc::clone(&stop);
-    let thread_listen_fd = Arc::clone(&listen_fd);
-    let thread_conn_fd = Arc::clone(&conn_fd);
-    let thread_inbox = Arc::clone(&inbox);
-
-    let listener = thread::spawn(move || {
-        // SAFETY: creating a libzt TCP socket with valid family/type values
-        let fd = unsafe { (thread_api.socket)(ZTS_AF_INET, ZTS_SOCK_STREAM, 0) };
-        if fd < 0 {
-            push_sys_event(&thread_inbox, "error", &format!("zts_socket failed: {fd}"));
-            return;
-        }
-
-        let any_ip = CString::new("0.0.0.0").expect("valid static ip");
-        // SAFETY: passing a valid C string and socket descriptor to libzt
-        let bind_ret = unsafe { (thread_api.bind)(fd, any_ip.as_ptr(), port) };
-        if bind_ret < 0 {
-            push_sys_event(
-                &thread_inbox,
-                "error",
-                &format!("zts_bind failed: {bind_ret}"),
-            );
-            zt_close_fd(&thread_api, fd);
-            return;
-        }
-
-        // SAFETY: valid socket descriptor and backlog
-        let listen_ret = unsafe { (thread_api.listen)(fd, 4) };
-        if listen_ret < 0 {
-            push_sys_event(
-                &thread_inbox,
-                "error",
-                &format!("zts_listen failed: {listen_ret}"),
-            );
-            zt_close_fd(&thread_api, fd);
-            return;
-        }
-
-        thread_listen_fd.store(fd, Ordering::SeqCst);
-        push_sys_event(
-            &thread_inbox,
-            "listener_started",
-            &format!("signal listening on 0.0.0.0:{port}"),
-        );
-
-        while !thread_stop.load(Ordering::SeqCst) {
-            let mut remote = [0_i8; ZTS_IP_MAX_STR_LEN + 1];
-            let mut remote_port = 0_u16;
-
-            // SAFETY: accept buffer is writable and properly sized
-            let client_fd = unsafe {
-                (thread_api.accept)(
-                    fd,
-                    remote.as_mut_ptr(),
-                    ZTS_IP_MAX_STR_LEN as i32,
-                    &mut remote_port,
-                )
-            };
-
-            if client_fd < 0 {
-                if thread_stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(200));
-                continue;
-            }
-
-            let old = thread_conn_fd.swap(client_fd, Ordering::SeqCst);
-            if old >= 0 {
-                zt_close_fd(&thread_api, old);
-            }
-
-            let remote_ip = if remote[0] == 0 {
-                "unknown".to_string()
-            } else {
-                // SAFETY: libzt accept writes a null-terminated IPv4/IPv6 string
-                unsafe { CStr::from_ptr(remote.as_ptr()) }
-                    .to_string_lossy()
-                    .to_string()
-            };
-            push_sys_event(
-                &thread_inbox,
-                "connected",
-                &format!("viewer connected from {remote_ip}:{remote_port}"),
-            );
-
-            let recv_handle = spawn_recv_thread(
-                thread_api,
-                Arc::clone(&thread_stop),
-                Arc::clone(&thread_conn_fd),
-                Arc::clone(&thread_inbox),
-                client_fd,
-                "signal",
-            );
-            let _ = recv_handle.join();
-        }
-
-        let active_conn = thread_conn_fd.swap(-1, Ordering::SeqCst);
-        let active_listener = thread_listen_fd.swap(-1, Ordering::SeqCst);
-        zt_close_fd(&thread_api, active_conn);
-        zt_close_fd(&thread_api, active_listener);
-        push_sys_event(&thread_inbox, "listener_stopped", "signal listener stopped");
-    });
-
-    let runtime = SignalRuntime {
-        api,
-        stop,
-        listen_fd,
-        conn_fd,
-        inbox,
-        threads: vec![listener],
-    };
-
-    let mut guard = signal_slot()
-        .lock()
-        .map_err(|_| "signal runtime lock poisoned".to_string())?;
-    *guard = Some(runtime);
-
-    append_libzt_log_line(&format!("signal listener initialized on {port}"));
-    Ok(())
-}
-
-#[tauri::command]
-fn zt_signal_connect(peer_ip: String, port: u16) -> Result<(), String> {
-    if port == 0 {
-        return Err("invalid signal port".to_string());
-    }
-    let peer_ip = peer_ip.trim().to_string();
-    if peer_ip.is_empty() {
-        return Err("peer_ip is empty".to_string());
-    }
-
-    zt_signal_close_internal(false)?;
-
-    let api = get_socket_api()?;
-
-    // SAFETY: creating a libzt TCP socket with valid family/type values
-    let fd = unsafe { (api.socket)(ZTS_AF_INET, ZTS_SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(format!("zts_socket failed: {fd}"));
-    }
-
-    let peer_cstr = CString::new(peer_ip.clone()).map_err(|e| format!("invalid peer_ip: {e}"))?;
-    // SAFETY: passing valid socket descriptor and peer endpoint to libzt
-    let connect_ret = unsafe {
-        (api.connect)(
-            fd,
-            peer_cstr.as_ptr(),
-            port,
-            LIBZT_SIGNAL_CONNECT_TIMEOUT_MS,
-        )
-    };
-    if connect_ret < 0 {
-        zt_close_fd(&api, fd);
-        return Err(format!("zts_connect failed: code={connect_ret}"));
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let listen_fd = Arc::new(AtomicI32::new(-1));
-    let conn_fd = Arc::new(AtomicI32::new(fd));
-    let inbox = Arc::new(Mutex::new(VecDeque::new()));
-
-    push_sys_event(
-        &inbox,
-        "connected",
-        &format!("connected to sharer {peer_ip}:{port}"),
-    );
-
-    let recv_handle = spawn_recv_thread(
-        api,
-        Arc::clone(&stop),
-        Arc::clone(&conn_fd),
-        Arc::clone(&inbox),
-        fd,
-        "signal",
-    );
-
-    let runtime = SignalRuntime {
-        api,
-        stop,
-        listen_fd,
-        conn_fd,
-        inbox,
-        threads: vec![recv_handle],
-    };
-
-    let mut guard = signal_slot()
-        .lock()
-        .map_err(|_| "signal runtime lock poisoned".to_string())?;
-    *guard = Some(runtime);
-
-    append_libzt_log_line(&format!("signal connected to {peer_ip}:{port}"));
-    Ok(())
-}
-
-#[tauri::command]
-fn zt_signal_send(payload: String) -> Result<(), String> {
-    if payload.trim().is_empty() {
-        return Ok(());
-    }
-
-    let (api, conn_fd, inbox) = {
-        let guard = signal_slot()
-            .lock()
-            .map_err(|_| "signal runtime lock poisoned".to_string())?;
-        let runtime = guard
-            .as_ref()
-            .ok_or_else(|| "signal runtime is not initialized".to_string())?;
-        (
-            runtime.api,
-            Arc::clone(&runtime.conn_fd),
-            Arc::clone(&runtime.inbox),
-        )
-    };
-
-    let fd = conn_fd.load(Ordering::SeqCst);
-    if fd < 0 {
-        return Err("signal peer is not connected".to_string());
-    }
-
-    let mut bytes = payload.into_bytes();
-    bytes.push(b'\n');
-
-    if let Err(err) = zt_send_all(&api, fd, &bytes) {
-        push_sys_event(&inbox, "error", &format!("signal send failed: {err}"));
-        return Err(err);
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-fn zt_signal_poll() -> Result<Vec<String>, String> {
-    let inbox = {
-        let guard = signal_slot()
-            .lock()
-            .map_err(|_| "signal runtime lock poisoned".to_string())?;
-        let Some(runtime) = guard.as_ref() else {
-            return Ok(Vec::new());
-        };
-        Arc::clone(&runtime.inbox)
-    };
-
-    let mut queue = inbox
-        .lock()
-        .map_err(|_| "signal inbox lock poisoned".to_string())?;
-
-    let mut out = Vec::with_capacity(queue.len());
-    while let Some(item) = queue.pop_front() {
-        out.push(item);
-    }
-
-    Ok(out)
-}
-
-#[tauri::command]
-fn zt_signal_close() -> Result<(), String> {
-    zt_signal_close_internal(false)
-}
-
-// 关闭媒体运行时：停止线程并关闭 UDP fd。
-fn zt_media_close_internal(wait_threads: bool) -> Result<(), String> {
-    let mut guard = media_slot()
-        .lock()
-        .map_err(|_| "media runtime lock poisoned".to_string())?;
-    let Some(mut runtime) = guard.take() else {
-        return Ok(());
-    };
-
-    runtime.stop.store(true, Ordering::SeqCst);
-
-    let fd = runtime.fd.swap(-1, Ordering::SeqCst);
-    zt_close_fd(&runtime.api, fd);
-
-    let threads = std::mem::take(&mut runtime.threads);
-    if wait_threads {
-        join_runtime_threads(threads);
-    } else {
-        join_runtime_threads_async(threads);
-    }
-
-    append_libzt_log_line("media runtime closed");
-    Ok(())
-}
-
-// 启动媒体运行时：创建并绑定 UDP socket，启动接收线程并维护 peer 信息。
-fn start_media_runtime(bind_port: u16, preset_peer: Option<(String, u16)>) -> Result<(), String> {
-    zt_media_close_internal(false)?;
-
-    let api = get_socket_api()?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let fd_slot = Arc::new(AtomicI32::new(-1));
-    let inbox = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
-    let peer = Arc::new(Mutex::new(None));
-
-    // SAFETY: creating a libzt UDP socket with valid family/type values
-    let fd = unsafe { (api.socket)(ZTS_AF_INET, ZTS_SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(format!("media zts_socket(dgram) failed: {fd}"));
-    }
-
-    let any_ip = CString::new("0.0.0.0").expect("valid static ip");
-    // SAFETY: passing a valid C string and socket descriptor to libzt
-    let bind_ret = unsafe { (api.bind)(fd, any_ip.as_ptr(), bind_port) };
-    if bind_ret < 0 {
-        zt_close_fd(&api, fd);
-        return Err(format!("media zts_bind failed: {bind_ret}"));
-    }
-
-    fd_slot.store(fd, Ordering::SeqCst);
-
-    if let Some((peer_ip, peer_port)) = preset_peer {
-        set_media_peer(&api, &fd_slot, &peer, peer_ip, peer_port)?;
-    }
-
-    let recv_api = api;
-    let recv_stop = Arc::clone(&stop);
-    let recv_fd_slot = Arc::clone(&fd_slot);
-    let recv_inbox = Arc::clone(&inbox);
-    let recv_peer = Arc::clone(&peer);
-    let recv_thread = thread::spawn(move || {
-        let mut buffer = [0_u8; 2048];
-        while !recv_stop.load(Ordering::SeqCst) {
-            let current_fd = recv_fd_slot.load(Ordering::SeqCst);
-            if current_fd < 0 {
-                break;
-            }
-            let mut remote = [0_i8; ZTS_IP_MAX_STR_LEN + 1];
-            let mut remote_port = 0_u16;
-            let n = if let Some(recvfrom) = recv_api.recvfrom {
-                // SAFETY: recvfrom writes into valid mutable buffers.
-                unsafe {
-                    recvfrom(
-                        current_fd,
-                        buffer.as_mut_ptr() as *mut c_void,
-                        buffer.len(),
-                        0,
-                        remote.as_mut_ptr(),
-                        ZTS_IP_MAX_STR_LEN as i32,
-                        &mut remote_port,
-                    )
-                }
-            } else {
-                // SAFETY: recv writes into a valid mutable buffer.
-                unsafe { (recv_api.recv)(current_fd, buffer.as_mut_ptr() as *mut c_void, buffer.len(), 0) }
-            };
-
-            if n > 0 {
-                let packet = buffer[..n as usize].to_vec();
-                push_media_packet(&recv_inbox, packet);
-
-                if remote[0] != 0 {
-                    let remote_ip = unsafe { CStr::from_ptr(remote.as_ptr()) }
-                        .to_string_lossy()
-                        .to_string();
-                    if !remote_ip.is_empty() {
-                        if let Ok(mut guard) = recv_peer.lock() {
-                            let should_update = guard
-                                .as_ref()
-                                .map(|p| p.ip != remote_ip || p.port != remote_port)
-                                .unwrap_or(true);
-                            if should_update {
-                                if let Ok(new_peer) = make_media_peer(remote_ip.clone(), remote_port)
-                                {
-                                    *guard = Some(new_peer);
-                                }
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            if n == 0 {
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-
-            if recv_stop.load(Ordering::SeqCst) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        let closed_fd = recv_fd_slot.swap(-1, Ordering::SeqCst);
-        zt_close_fd(&recv_api, closed_fd);
-    });
-
-    let runtime = MediaRuntime {
-        api,
-        stop,
-        fd: fd_slot,
-        inbox,
-        peer,
-        threads: vec![recv_thread],
-    };
-
-    let mut guard = media_slot()
-        .lock()
-        .map_err(|_| "media runtime lock poisoned".to_string())?;
-    *guard = Some(runtime);
-
-    append_libzt_log_line(&format!("media udp opened on 0.0.0.0:{bind_port}"));
-    Ok(())
-}
-
-#[tauri::command]
-// 共享端入口：监听本地媒体 UDP 端口。
-fn zt_media_listen(port: u16) -> Result<(), String> {
-    if port == 0 {
-        return Err("invalid media port".to_string());
-    }
-    start_media_runtime(port, None)
-}
-
-#[tauri::command]
-// 观看端入口：启动本地 UDP 并预设远端 peer 地址。
-fn zt_media_connect(peer_ip: String, port: u16) -> Result<(), String> {
-    if port == 0 {
-        return Err("invalid media port".to_string());
-    }
-    let peer_ip = peer_ip.trim().to_string();
-    if peer_ip.is_empty() {
-        return Err("peer_ip is empty".to_string());
-    }
-    start_media_runtime(port, Some((peer_ip, port)))
-}
-
-#[tauri::command]
-// 运行中动态修改媒体 peer（用于地址变化或首次学习后覆盖）。
-fn zt_media_set_peer(peer_ip: String, port: u16) -> Result<(), String> {
-    if port == 0 {
-        return Err("invalid media peer port".to_string());
-    }
-    let peer_ip = peer_ip.trim().to_string();
-    if peer_ip.is_empty() {
-        return Err("peer_ip is empty".to_string());
-    }
-
-    let guard = media_slot()
-        .lock()
-        .map_err(|_| "media runtime lock poisoned".to_string())?;
-    let runtime = guard
-        .as_ref()
-        .ok_or_else(|| "media runtime is not initialized".to_string())?;
-    set_media_peer(&runtime.api, &runtime.fd, &runtime.peer, peer_ip, port)
-}
-
-#[tauri::command]
-// 发送单个媒体 UDP 包。
-fn zt_media_send(payload: Vec<u8>) -> Result<(), String> {
-    if payload.is_empty() {
-        return Ok(());
-    }
-
-    let guard = media_slot()
-        .lock()
-        .map_err(|_| "media runtime lock poisoned".to_string())?;
-    let runtime = guard
-        .as_ref()
-        .ok_or_else(|| "media runtime is not initialized".to_string())?;
-    media_send_packet(runtime, &payload)
-}
-
-#[tauri::command]
-// 按批次发送媒体 UDP 包，并在 spread_ms 窗口内做 pacing。
-fn zt_media_send_batch(packets: Vec<Vec<u8>>, spread_ms: u16) -> Result<(), String> {
-    if packets.is_empty() {
-        return Ok(());
-    }
-    if packets.len() > MEDIA_MAX_BATCH_PACKETS {
-        return Err(format!(
-            "media packet batch too large: {} (max={MEDIA_MAX_BATCH_PACKETS})",
-            packets.len()
-        ));
-    }
-
-    let (api, fd_slot, peer_slot) = {
-        let guard = media_slot()
-            .lock()
-            .map_err(|_| "media runtime lock poisoned".to_string())?;
-        let runtime = guard
-            .as_ref()
-            .ok_or_else(|| "media runtime is not initialized".to_string())?;
-        (runtime.api, Arc::clone(&runtime.fd), Arc::clone(&runtime.peer))
-    };
-
-    let interval_ns = if packets.len() > 1 {
-        let span_ns = u128::from(spread_ms) * 1_000_000u128;
-        (span_ns / (packets.len() as u128 - 1)).min(u64::MAX as u128) as u64
-    } else {
-        0
-    };
-    let pacing_start = Instant::now();
-
-    for (idx, packet) in packets.iter().enumerate() {
-        if interval_ns > 0 && idx > 0 {
-            let target_at =
-                pacing_start + Duration::from_nanos(interval_ns.saturating_mul(idx as u64));
-            let now = Instant::now();
-            if target_at > now {
-                thread::sleep(target_at.duration_since(now));
-            }
-        }
-
-        media_send_packet_by_parts(&api, &fd_slot, &peer_slot, packet)?;
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-// 轮询拉取已接收的媒体 UDP 包（一次最多返回固定上限）。
-fn zt_media_poll() -> Result<Vec<Vec<u8>>, String> {
-    let inbox = {
-        let guard = media_slot()
-            .lock()
-            .map_err(|_| "media runtime lock poisoned".to_string())?;
-        let Some(runtime) = guard.as_ref() else {
-            return Ok(Vec::new());
-        };
-        Arc::clone(&runtime.inbox)
-    };
-
-    let mut queue = inbox
-        .lock()
-        .map_err(|_| "media inbox lock poisoned".to_string())?;
-
-    let mut out = Vec::with_capacity(queue.len().min(MEDIA_MAX_BATCH_PACKETS));
-    while let Some(item) = queue.pop_front() {
-        out.push(item);
-        if out.len() >= MEDIA_MAX_BATCH_PACKETS {
-            break;
-        }
-    }
-
-    Ok(out)
-}
-
-#[tauri::command]
-// 对外关闭媒体通道命令。
-fn zt_media_close() -> Result<(), String> {
-    zt_media_close_internal(false)
-}
-
-#[tauri::command]
-fn zt_start(app: tauri::AppHandle, network_id: String) -> Result<String, String> {
-    let net_id = parse_network_id(&network_id)?;
-    let log_dir = resolve_log_dir(&app)?;
-    ensure_log_dir(&log_dir)?;
-    let libzt_log_path = log_dir.join("frontend.log");
-    set_libzt_log_path(libzt_log_path.clone());
-
-    let mut runtime_guard = runtime_slot()
-        .lock()
-        .map_err(|_| "libzt runtime lock poisoned".to_string())?;
-    if runtime_guard.is_some() {
-        append_libzt_log_line("libzt already started");
-        return Ok("libzt already started".to_string());
-    }
-
-    let dll_path = resolve_libzt_dll_path(&app)?;
-    append_libzt_log_line(&format!("loading libzt from {}", dll_path.display()));
-
-    let api = load_libzt_api(&dll_path)?;
-
-    let storage_dir = resolve_libzt_storage_dir(&log_dir);
-    ensure_log_dir(&storage_dir)?;
-    let storage_path = CString::new(storage_dir.to_string_lossy().to_string())
-        .map_err(|e| format!("invalid storage path: {e}"))?;
-
-    // SAFETY: FFI calls with validated pointers and initialization order from libzt API docs
-    unsafe {
-        check_libzt_ret(
-            "zts_init_set_event_handler",
-            (api.init_set_event_handler)(Some(libzt_event_handler)),
-        )?;
-        check_libzt_ret(
-            "zts_init_from_storage",
-            (api.init_from_storage)(storage_path.as_ptr()),
-        )?;
-        check_libzt_ret("zts_node_start", (api.node_start)())?;
-    }
-
-    let mut online = false;
-    for _ in 0..NODE_ONLINE_WAIT_TRIES {
-        // SAFETY: no parameters and no aliasing involved
-        let status = unsafe { (api.node_is_online)() };
-        if status < 0 {
-            return Err(format!("zts_node_is_online failed: code={status}"));
-        }
-        if status == 1 {
-            online = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(NODE_ONLINE_WAIT_INTERVAL_MS));
-    }
-
-    if !online {
-        append_libzt_log_line("node did not become online within timeout");
-    } else {
-        append_libzt_log_line("node online");
-    }
-
-    // SAFETY: net_id parsed from user hex input
-    unsafe {
-        check_libzt_ret("zts_net_join", (api.net_join)(net_id))?;
-    }
-
-    let mut assigned_ip: Option<String> = None;
-    for _ in 0..IP_ASSIGN_WAIT_TRIES {
-        assigned_ip = try_get_libzt_ip4(&api, net_id);
-        if assigned_ip.is_some() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(IP_ASSIGN_WAIT_INTERVAL_MS));
-    }
-
-    if let Some(ip) = &assigned_ip {
-        append_libzt_log_line(&format!("joined network {network_id}, ip={ip}"));
-    } else {
-        append_libzt_log_line(&format!(
-            "joined network {network_id}, waiting for ip assignment"
-        ));
-    }
-
-    *runtime_guard = Some(LibztRuntime {
-        api,
-        network_id: net_id,
-    });
-
-    Ok(format!(
-        "libzt started, network={} ip={}",
-        network_id,
-        assigned_ip.unwrap_or_else(|| "pending".to_string())
-    ))
-}
-
-#[tauri::command]
-fn zt_stop() -> Result<(), String> {
-    zt_signal_close_internal(true)?;
-    zt_media_close_internal(true)?;
-
-    let mut runtime_guard = runtime_slot()
-        .lock()
-        .map_err(|_| "libzt runtime lock poisoned".to_string())?;
-    let Some(runtime) = runtime_guard.take() else {
-        append_libzt_log_line("libzt stop requested but runtime not started");
-        return Ok(());
-    };
-
-    append_libzt_log_line(&format!("stopping libzt network={:x}", runtime.network_id));
-
-    // SAFETY: runtime holds valid function pointers while library is alive
-    unsafe {
-        let stop_ret = (runtime.api.node_stop)();
-        if stop_ret < 0 {
-            append_libzt_log_line(&format!("zts_node_stop failed: code={stop_ret}"));
-        }
-        if should_call_node_free_on_stop() {
-            let free_ret = (runtime.api.node_free)();
-            if free_ret < 0 {
-                append_libzt_log_line(&format!("zts_node_free failed: code={free_ret}"));
-            } else {
-                append_libzt_log_line("zts_node_free executed by opt-in env flag");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-fn zt_get_ip() -> Result<Option<String>, String> {
-    let guard = runtime_slot()
-        .lock()
-        .map_err(|_| "libzt runtime lock poisoned".to_string())?;
-    let Some(runtime) = guard.as_ref() else {
-        return Ok(None);
-    };
-
-    Ok(try_get_libzt_ip4(&runtime.api, runtime.network_id))
-}
 
 #[tauri::command]
 fn append_log(app: tauri::AppHandle, message: String) -> Result<(), String> {
@@ -1490,6 +1076,25 @@ fn ensure_log_dir(dir: &Path) -> Result<(), String> {
     create_dir_all(dir).map_err(|e| e.to_string())
 }
 
+fn truncate_log_file(path: &Path) -> Result<(), String> {
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn initialize_frontend_log(app: &tauri::AppHandle) -> Result<(), String> {
+    let log_dir = resolve_log_dir(app)?;
+    ensure_log_dir(&log_dir)?;
+    let log_path = log_dir.join("frontend.log");
+    truncate_log_file(&log_path)?;
+    set_libzt_log_path(log_path);
+    Ok(())
+}
+
 fn write_log_line(path: &Path, message: &str) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -1537,8 +1142,13 @@ fn open_directory(_path: &Path) -> Result<(), io::Error> {
     ))
 }
 
-fn main() {
+pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            initialize_frontend_log(&app.handle())
+                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             append_log,
             open_log_dir,
@@ -1561,4 +1171,8 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn main() {
+    run();
 }

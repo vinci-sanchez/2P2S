@@ -1,0 +1,126 @@
+Viewer Metrics
+这些是观看端接收和播放链路指标，格式定义在
+rx_in_pkts/s
+观看端每秒收到的媒体包数。当前实现里它和 rx_pkts/s 是同一个计数，实际上是重复字段。
+rx_pkts/s
+同上。代码里两者都取 state.rx_pkts_sec。
+rx_kbps
+每秒收到的媒体总比特率，按包字节数折算。
+frames_completed/s
+每秒成功把一个 frame 的所有数据包拼完整的次数。计数发生在
+frames_played/s
+每秒真正画到远端画布上的帧数。计数发生在解码器 output 回调里
+drop_deadline/s
+到了 frame deadline 还没凑齐，只能放弃的帧数
+expired_frames/s
+被标记为过期、后续解码时跳过的帧数。这里和 drop_deadline/s 基本同步增加
+missing_on_deadline_pkts/s
+这些被放弃帧里，一共缺了多少个包
+late_after_deadline_pkts/s
+某个 frame 已经被判过期后，迟到才到的包数
+nack_enqueued/s
+每秒加入 NACK 队列、准备请求重传的缺包项数
+nack_sent/s
+每秒实际发出去的 NACK 包数量
+nack_skip_rtt/s
+因为离 frame deadline 太近，估计等重传也来不及，所以放弃发 NACK 的次数。见 media.js (line 2385)。
+nack_skip_missing/s
+因为这个 delta frame 缺包太多，判定“救不回来了”，直接不做 NACK、转而请求关键帧时累计的缺包数。见 media.js (line 2368)。
+nack_skip_round_frames/s
+某些 frame 的 NACK 重试轮次已经打满，继续重传没有意义，于是放弃的 frame 数。见 media.js (line 2350)。
+avg_pkt_cnt_per_frame
+平均每个“成功完成组帧”的 frame 由多少个数据包组成。值越大，单帧越重，链路越容易抖。
+out_of_order_rate
+乱序率，大致是乱序到达的数据包占比。计算在 media.js (line 156)。
+pli/min
+观看端最近 60 秒发了多少次 PLI，也就是“请给我一个关键帧”。
+target_delay_ms
+接收端当前目标播放延迟，用来给乱序、丢包、重传留缓冲，不是端到端真实延迟。计算在 media.js (line 1936)。
+bad_link=on/off
+是否进入坏链路模式。这是内部策略开关，不是原始网络状态。它由乱序、late、drop、missing、NACK 轮次失败等阈值共同触发，见 media.js (line 247)。
+看 viewer 指标时最常用的判断法：
+
+frames_completed/s > 0 但 frames_played/s = 0
+说明收到了完整帧，但解码/播放推进卡住了。
+drop_deadline/s、expired_frames/s、missing_on_deadline_pkts/s 很高
+说明链路差，帧经常来不及凑齐。
+pli/min 很高
+说明接收端一直在求关键帧恢复。
+Sender Metrics
+这些是共享端采集、编码、发送链路指标，格式定义在 main.js (line 1185)。
+
+capture_in/s
+每秒采集到多少个原始屏幕帧。见 media.js (line 768) 和 media.js (line 823)。
+cadence_skip/s
+因为帧率节流策略，这些采集帧没必要编码，直接跳过的次数。见 media.js (line 770) 和 media.js (line 825)。
+encode_attempt/s
+真正尝试送进编码器的次数。见 media.js (line 714)。
+budget_drop/s
+因为 VBV 预算不够，编码前就被丢掉的帧数。见 media.js (line 720)。
+encoded/s
+实际成功提交给编码器的帧数。见 media.js (line 727)。
+motion
+当前画面运动等级：static / low / high。来自帧间亮度差分析 media.js (line 674)。
+motion_score
+运动强度分数，越大说明画面变化越剧烈。阈值在 media.js (line 677) 到 media.js (line 685)。
+tx_out_pkts/s
+每秒发出的媒体包数。当前实现里它和 tx_pkts/s 也是同一个计数，属于重复字段。
+tx_pkts/s
+同上。
+tx_kbps
+每秒发出的总比特率，按实际线上的包字节统计。
+frames_sent/s
+每秒真正发出去的视频帧数。见 media.js (line 1314)。
+keyframes/s
+这一秒里发了多少关键帧。见 media.js (line 1316)。
+avg_pkt_cnt_per_frame
+平均每个已发送 frame 用了多少个数据包。注意这里不含 FEC 包，因为统计加的是 data_packets.length，见 media.js (line 1315)。
+nack_rx/s
+共享端每秒收到多少个 NACK 请求，也就是对端在催哪些包重传。见 media.js (line 2184)。
+pli_rx/min
+共享端最近 60 秒收到多少次 PLI，也就是对端最近多频繁地“要关键帧”。见 media.js (line 2193)。
+vbv_target_kbps
+当前发送控制策略给编码器设定的目标码率。
+encoder_kbps
+实际编码器配置的码率。
+fps
+当前目标发送帧率。
+codec
+当前编码格式，比如 H264。
+res_profile
+当前使用的分辨率档位策略，比如 360p。
+res
+实际编码分辨率。
+queue_delay_ms
+发送端估算的排队时延，大致是 当前 RTT - 最小 RTT，见 media.js (line 2161)。
+rtt_ms
+通过反馈探测得到的往返时延，见 media.js (line 2159)。
+fec_rate
+当前前向纠错比例。比如 30% 可以理解成大约每 10 个数据包再补 3 个冗余包。
+bad_link=on/off
+共享端是否也进入坏链路发送策略。
+看 sender 指标时最常用的判断法：
+
+capture_in/s 高，但 encoded/s 低
+说明采集到了，但编码或预算在拦。
+budget_drop/s 高
+说明发送预算不够，主动丢帧了。
+nack_rx/s、pli_rx/min 高
+说明对端在持续丢包或持续恢复。
+tx_kbps 明显高于 vbv_target_kbps
+说明虽然目标码率降了，但关键帧/FEC/突发包量仍在把链路压满。
+状态/事件日志
+这些不是“每秒指标”，但很关键。
+
+bad link mode enabled | reason=...
+进入坏链路模式，后面会更激进地降档、加 FEC、拉高延迟容忍。原因字段就是触发条件摘要。
+rx decode anchor | frame=...
+观看端找到新的解码锚点，通常是拿到关键帧后开始解码。
+rx decode skip expired frame=...
+某个 frame 已经过期，直接跳过。
+rx decode re-anchor | from=... to=...
+说明原来的解码推进被缺失 frame 卡住了，现在强制跳到后面的可用 frame 继续播。
+send policy changed/evaluated | ...
+发送策略评估结果，包括当前档位、路由、是否坏链路、码率上限、FEC 下限等，见 media.js (line 482)。
+NODE_ONLINE / NODE_OFFLINE
+这是 libzt 节点状态事件，不等价于“媒体一定断了”或“一定恢复了”

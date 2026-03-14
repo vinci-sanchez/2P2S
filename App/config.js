@@ -1,4 +1,4 @@
-﻿const config = {
+const config = {
   appName: "2P2S(tauri)",
   signaling: {
     secure: true,

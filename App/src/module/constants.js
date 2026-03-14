@@ -1,0 +1,146 @@
+export const SHARE_PROFILES = {
+  "360p": { width: 640, height: 360, maxBitrateKbps: 900, minBpf: 7000 },
+  "480p": { width: 854, height: 480, maxBitrateKbps: 1400, minBpf: 10000 },
+  "720p": { width: 1280, height: 720, maxBitrateKbps: 2600, minBpf: 18000 },
+  "1080p": { width: 1920, height: 1080, maxBitrateKbps: 5200, minBpf: 30000 },
+};
+
+export const DEFAULT_QUALITY = "720p";
+export const FPS_LEVELS = [12, 15, 20, 24, 30, 40, 50, 60, 80];
+
+export const SIGNAL_POLL_INTERVAL_MS = 120;
+export const MEDIA_POLL_INTERVAL_MS = 6;
+export const LIBZT_EVENT_POLL_INTERVAL_MS = 500;
+export const STATS_INTERVAL_MS = 500;
+export const METRICS_LOG_INTERVAL_MS = 1000;
+export const CC_INTERVAL_MS = 220;
+export const PLI_TIMEOUT_MS = 900;
+export const KEYFRAME_INTERVAL_MS = 3000;
+export const PLI_MIN_INTERVAL_MS = 1000;
+export const MIN_KEYFRAME_GAP_MS = 1200;
+export const RX_SMALL_GAP_GRACE_MS = 100;
+export const RX_FRAME_HARD_DEADLINE_DELTA_MS = 280;
+export const RX_FRAME_HARD_DEADLINE_KEYFRAME_MS = 420;
+export const RX_FRAME_HARD_DEADLINE_BAD_LINK_DELTA_MS = 700;
+export const RX_FRAME_HARD_DEADLINE_BAD_LINK_KEYFRAME_MS = 1000;
+export const FPS_COOLDOWN_MS = 800;
+export const OFFLINE_DEBOUNCE_MS = 3000;
+export const LIBZT_OFFLINE_IDLE_INVALIDATE_MS = 2500;
+export const LIBZT_READY_GRACE_MS = 15000;
+export const LIBZT_READY_POLL_MS = 150;
+export const SIGNAL_RECONNECT_DELAYS_MS = [1000, 2000, 5000, 8000, 12000];
+export const MAX_AUTO_RECONNECT_ATTEMPTS = SIGNAL_RECONNECT_DELAYS_MS.length;
+export const VIEWER_CONNECT_MAX_ATTEMPTS = 6;
+export const VIEWER_CONNECT_RETRY_DELAY_MS = 350;
+export const MAX_UI_LOG_ITEMS = 300;
+
+export const PACKET_MAX_BYTES = 1200;
+export const PACKET_HEADER_BYTES = 32;
+export const PACKET_PAYLOAD_BYTES = PACKET_MAX_BYTES - PACKET_HEADER_BYTES;
+export const PACING_MIN_MS = 5;
+export const PACING_MAX_MS = 24;
+export const JITTER_MIN_MS = 20;
+export const JITTER_MAX_MS = 140;
+export const RX_DEADLINE_SAFETY_MS = 140;
+export const RX_DEADLINE_BONUS_PER_PKT_MS = 5;
+export const RX_DEADLINE_MAX_BONUS_MS = 120;
+export const RX_TARGET_DELAY_FLOOR_MS = 34;
+export const RX_TARGET_DELAY_BAD_LINK_FLOOR_MS = 68;
+export const RX_TARGET_DELAY_DROP_PENALTY_MS = 8;
+export const RX_TARGET_DELAY_MISSING_PKT_PENALTY_MS = 2;
+export const RX_TARGET_DELAY_NACK_ROUND_PENALTY_MS = 1;
+export const RX_NEED_KEYFRAME_DROP_THRESHOLD = 3;
+export const RX_NEED_KEYFRAME_DROP_WINDOW_MS = 900;
+export const RX_SEQ_REORDER_GAP_THRESHOLD = 48;
+export const RX_SEQ_REORDER_HOLD_MS = 140;
+export const RX_SEQ_REORDER_MAX_PENDING = 640;
+export const RX_REORDER_ADAPTIVE_MAX_GAP = 96;
+export const RX_REORDER_ADAPTIVE_MAX_HOLD_MS = 360;
+export const DELTA_NACK_MAX_PER_FRAME = 4;
+export const DELTA_NACK_MAX_MISSING = 10;
+export const DELTA_NACK_MAX_ROUNDS = 4;
+export const DELTA_NACK_REMAIN_GUARD_MS = 2;
+export const RX_REPAIR_SLACK_MS = 40;
+export const RX_REPAIR_SLACK_KEYFRAME_MS = 70;
+export const RX_REPAIR_SLACK_BAD_LINK_MS = 120;
+export const RX_REPAIR_SLACK_BAD_LINK_KEYFRAME_MS = 180;
+export const NACK_GAP_IMMEDIATE_RUN_THRESHOLD = 6;
+export const NACK_GAP_DELAY_STRONG_MS = 4;
+export const NACK_GAP_DELAY_WEAK_MS = 12;
+export const NACK_FLUSH_BATCH_MS = 3;
+export const NACK_RETRY_MIN_INTERVAL_MS = 5;
+export const NACK_UNKNOWN_RTT_MS = 35;
+export const NACK_KEYFRAME_MAX_MISSING = 7;
+export const NACK_KEYFRAME_MAX_ROUNDS = 3;
+export const RX_GLOBAL_NACK_PACKET_BUDGET = 24;
+export const RX_GLOBAL_NACK_FRAME_BUDGET = 8;
+export const RX_GLOBAL_NACK_BAD_LINK_PACKET_BUDGET = 96;
+export const RX_GLOBAL_NACK_BAD_LINK_FRAME_BUDGET = 22;
+export const FEC_MIN_RATE = 0.14;
+export const FEC_MAX_RATE = 0.28;
+export const FEC_HYSTERESIS_UP_STEP = 0.01;
+export const FEC_HYSTERESIS_DOWN_STEP = 0.02;
+export const FEC_HYSTERESIS_HOLD_MS = 1500;
+export const RELAY_PROFILE_KEY = "360p";
+export const RELAY_MAX_FPS = 20;
+export const RELAY_FEC_FLOOR = 0.18;
+export const RELAY_BITRATE_CAP_BPS = 900_000;
+export const BAD_LINK_PROFILE_KEY = "360p";
+export const BAD_LINK_MAX_FPS = 18;
+export const BAD_LINK_FEC_FLOOR = 0.3;
+export const BAD_LINK_BITRATE_CAP_BPS = 600_000;
+export const BAD_LINK_HOLD_MS = 5000;
+export const BAD_LINK_WARMUP_MS = 2000;
+export const BAD_LINK_SIGNAL_INTERVAL_MS = 1000;
+export const BAD_LINK_EXTRA_REORDER_GAP = 16;
+export const BAD_LINK_EXTRA_REORDER_HOLD_MS = 40;
+export const BAD_LINK_EXTRA_DEADLINE_MS = 60;
+export const BAD_LINK_EXTRA_TARGET_DELAY_MS = 26;
+export const BAD_LINK_TRIGGER_OUT_OF_ORDER_RATE = 0.16;
+export const BAD_LINK_TRIGGER_MIN_REORDER_PKTS = 72;
+export const BAD_LINK_TRIGGER_LATE_PKTS_PER_SEC = 10;
+export const BAD_LINK_TRIGGER_DROP_FRAMES_PER_SEC = 2;
+export const BAD_LINK_TRIGGER_DROP_FRAME_RATIO = 0.22;
+export const BAD_LINK_TRIGGER_MIN_FRAME_OUTCOMES = 18;
+export const BAD_LINK_TRIGGER_MISSING_PKTS_PER_SEC = 16;
+export const BAD_LINK_TRIGGER_MISSING_PKT_RATIO = 0.35;
+export const BAD_LINK_TRIGGER_MIN_RX_DATA_PKTS = 48;
+export const BAD_LINK_TRIGGER_NACK_SKIP_ROUNDS_PER_SEC = 24;
+export const BAD_LINK_TRIGGER_NACK_SKIP_ROUND_FRAME_RATIO = 0.7;
+export const BAD_LINK_TRIGGER_MIN_NACK_FRAMES = 10;
+export const BAD_LINK_TRIGGER_CONSECUTIVE_HITS = 4;
+export const BAD_LINK_TRIGGER_IMMEDIATE_DROP_FRAMES_PER_SEC = 3;
+export const BAD_LINK_TRIGGER_IMMEDIATE_NACK_SKIP_ROUNDS_PER_SEC = 64;
+export const UNKNOWN_PROFILE_KEY = "480p";
+export const UNKNOWN_MAX_FPS = 24;
+export const UNKNOWN_FEC_FLOOR = 0.14;
+export const LINK_POLICY_DIRECT_STABLE_MS = 8000;
+export const LINK_POLICY_SWITCH_COOLDOWN_MS = 5000;
+export const PROFILE_UPGRADE_TARGET_RATIO = 0.85;
+export const TRACK_PROCESSOR_FAILURE_THRESHOLD = 3;
+export const ENCODER_RECONFIGURE_COOLDOWN_MS = 2000;
+export const ENCODER_BITRATE_BUCKET_STEP_BPS = 300_000;
+export const KEYFRAME_CACHE_KEEP_MS = 3000;
+export const DELTA_CACHE_KEEP_MS = 1200;
+export const RETRANS_CACHE_MAX_ITEMS = 1800;
+export const MIN_RTT_WINDOW_MS = 15_000;
+
+export const PKT_KIND_DATA = 0;
+export const PKT_KIND_FEEDBACK_REQ = 1;
+export const PKT_KIND_FEEDBACK = 2;
+export const PKT_KIND_NACK = 3;
+export const PKT_KIND_PLI = 4;
+
+export const FLAG_KEYFRAME = 1 << 0;
+export const FLAG_FEC = 1 << 1;
+export const FLAG_RETRANS = 1 << 2;
+export const FLAG_CODEC_VP8 = 1 << 3;
+
+export const LIBZT_NOISY_EVENT_MARKERS = [
+  "(PEER_DIRECT)",
+  "(PEER_RELAY)",
+  "(PEER_UNREACHABLE)",
+  "code=219",
+  "code=243",
+  "code=244",
+];
